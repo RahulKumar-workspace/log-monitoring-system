@@ -1,0 +1,223 @@
+# =============================================================================
+# CI — Lint & Quality Checks
+# =============================================================================
+#
+# PURPOSE:
+#   This GitHub Actions workflow automatically checks the quality of our code
+#   every time someone pushes to the main branch or opens a pull request
+#   targeting main. It runs two categories of checks:
+#
+#     1. Backend (Python)  — uses "ruff", a fast Python linter, to catch
+#        syntax errors, undefined names, and general style issues.
+#     2. Frontend (React)  — uses "ESLint", the standard JavaScript/JSX
+#        linter, to enforce code-quality rules in our React application.
+#
+#   By running these checks in CI (Continuous Integration), we catch problems
+#   early — before they ever reach production.
+# =============================================================================
+
+name: "CI — Lint & Quality Checks"
+
+# -----------------------------------------------------------------------------
+# TRIGGERS
+# -----------------------------------------------------------------------------
+# "on" defines WHEN this workflow will run.
+#
+#   • push → branches: [main]
+#       Runs every time code is pushed (merged) directly into the main branch.
+#
+#   • pull_request → branches: [main]
+#       Runs every time a pull request is opened, synchronized (new commits
+#       pushed to the PR branch), or reopened against main. This lets
+#       reviewers see lint results *before* merging.
+# -----------------------------------------------------------------------------
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# -----------------------------------------------------------------------------
+# JOBS
+# -----------------------------------------------------------------------------
+# A "job" is a set of steps that execute on the same runner (virtual machine).
+# We define a single job called "lint" because all our checks can share the
+# same checkout and run sequentially — no need for parallelism here.
+# -----------------------------------------------------------------------------
+jobs:
+  lint:
+    # -------------------------------------------------------------------------
+    # RUNNER
+    # -------------------------------------------------------------------------
+    # "runs-on" chooses the type of virtual machine GitHub will spin up.
+    # "ubuntu-latest" gives us a fresh Ubuntu Linux environment with common
+    # dev tools pre-installed. It's the most popular (and cheapest) choice.
+    # -------------------------------------------------------------------------
+    runs-on: ubuntu-latest
+
+    steps:
+      # =======================================================================
+      # STEP 1 — Checkout the repository
+      # =======================================================================
+      # Before we can lint anything, we need the source code!
+      # actions/checkout@v4 clones the repository into the runner so that
+      # all subsequent steps can access our files (backend/, frontend/, etc.).
+      # Without this step, the runner starts with an empty workspace.
+      # =======================================================================
+      - name: "📥 Checkout repository"
+        uses: actions/checkout@v4
+
+      # =======================================================================
+      # STEP 2 — Set up Python 3.11
+      # =======================================================================
+      # Our backend is written in Python, so we need a Python interpreter.
+      # actions/setup-python@v5 installs the requested Python version and
+      # adds it to the system PATH.
+      #
+      # "cache: pip" tells the action to cache downloaded pip packages
+      # between workflow runs. This speeds things up significantly because
+      # pip won't have to re-download packages that haven't changed.
+      # The cache key is automatically derived from requirements files.
+      # =======================================================================
+      - name: "🐍 Set up Python 3.11"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          # Cache pip's download cache (~/.cache/pip) so repeated runs are
+          # faster. GitHub invalidates the cache when the hash of the
+          # requirements file changes, ensuring we always get fresh deps
+          # when they're updated.
+          cache: "pip"
+
+      # =======================================================================
+      # STEP 3 — Install backend dependencies
+      # =======================================================================
+      # We install two things here:
+      #
+      #   1. "ruff" — an extremely fast Python linter & formatter written in
+      #      Rust. It replaces flake8, isort, pyflakes, and more.
+      #
+      #   2. The project's own backend dependencies from requirements.txt.
+      #      We install these so that ruff can resolve imports correctly and
+      #      avoid false "module not found" errors.
+      #
+      # Both commands are joined with "&&" so the step fails immediately if
+      # either one errors out.
+      # =======================================================================
+      - name: "📦 Install backend dependencies"
+        run: |
+          # Install ruff (our Python linter) globally via pip
+          pip install ruff
+
+          # Install the backend's own dependencies so import checks work
+          pip install -r backend/requirements.txt
+
+      # =======================================================================
+      # STEP 4 — Lint backend with ruff
+      # =======================================================================
+      # We run ruff TWICE, with different intentions:
+      #
+      #   Pass 1 — CRITICAL checks (fail the build if any fire):
+      #     --select E9,F63,F7,F82 focuses on a small set of show-stopper
+      #     errors:
+      #       • E9   — Python syntax errors (code won't even parse)
+      #       • F63  — Invalid star expressions / assertions
+      #       • F7   — Statement-level issues (e.g., "assert" with a tuple)
+      #       • F82  — Undefined names (using a variable that doesn't exist)
+      #     These are NOT style nitpicks — they are real bugs. If any are
+      #     found, the step exits non-zero and the whole workflow fails.
+      #
+      #   Pass 2 — GENERAL check (warning-only, never fails the build):
+      #     The second invocation runs ruff with ALL default rules. The
+      #     "|| true" at the end means "even if ruff finds issues, treat
+      #     the step as successful." This gives developers visibility into
+      #     style issues without blocking their PR. Over time, you can
+      #     remove "|| true" to enforce stricter standards.
+      # =======================================================================
+      - name: "🔍 Lint backend (Python) with ruff"
+        run: |
+          # ---- Pass 1: Critical checks — MUST pass ----
+          # If any of these fire, it means there's a genuine bug in the code.
+          # The build will fail and the developer must fix the issue.
+          ruff check --select E9,F63,F7,F82 backend/
+
+          # ---- Pass 2: General lint — advisory only ----
+          # Run ALL default ruff rules. "|| true" ensures this step always
+          # succeeds, so style warnings don't block the PR. Review the
+          # output in the Actions log to improve code quality over time.
+          ruff check backend/ || true
+
+      # =======================================================================
+      # STEP 5 — Set up Node.js 20
+      # =======================================================================
+      # Our frontend is a React app built with Node.js. This step installs
+      # Node.js 20 (the current LTS version) on the runner.
+      #
+      # "cache: npm" works like pip caching above — it stores the npm
+      # download cache (~/.npm) between runs to speed up installs.
+      #
+      # "cache-dependency-path" tells the action WHERE to find the lockfile
+      # so it can compute the correct cache key. Since our package-lock.json
+      # lives inside frontend/ (not the repo root), we must specify its
+      # path explicitly.
+      # =======================================================================
+      - name: "⬢ Set up Node.js 20"
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          # Cache npm's global package cache for faster installs
+          cache: "npm"
+          # Point to the lockfile inside the frontend directory so the
+          # cache key is computed from the correct file
+          cache-dependency-path: frontend/package-lock.json
+
+      # =======================================================================
+      # STEP 6 — Install frontend dependencies
+      # =======================================================================
+      # "npm ci" (Clean Install) is the CI-optimized version of "npm install".
+      # Key differences from "npm install":
+      #   • It requires an existing package-lock.json (fails if missing).
+      #   • It installs EXACT versions from the lockfile (no surprise upgrades).
+      #   • It deletes node_modules/ first for a guaranteed clean slate.
+      #   • It's faster because it skips the dependency-resolution step.
+      #
+      # "working-directory" tells GitHub Actions to cd into frontend/ before
+      # running the command, since that's where our package.json lives.
+      # =======================================================================
+      - name: "📦 Install frontend dependencies"
+        working-directory: frontend/
+        run: |
+          # Perform a clean, reproducible install of all frontend packages
+          npm ci
+
+      # =======================================================================
+      # STEP 7 — Run ESLint on the frontend
+      # =======================================================================
+      # ESLint is the de-facto linter for JavaScript and JSX (React) code.
+      #
+      # Flags explained:
+      #   --ext js,jsx
+      #       Only lint files with .js or .jsx extensions. This prevents
+      #       ESLint from wasting time on non-JS files (images, CSS, etc.).
+      #
+      #   --report-unused-disable-directives
+      #       Warns when a "// eslint-disable" comment exists but isn't
+      #       actually suppressing any rule. Keeps disable comments tidy.
+      #
+      #   --max-warnings 0
+      #       Treats ANY warning as an error (exit code 1). This enforces
+      #       a zero-warning policy — but because we append "|| true", the
+      #       step won't actually fail the build. It's purely informational
+      #       for now. Remove "|| true" when you're ready to enforce it.
+      #
+      # "|| true" — same trick as the ruff general check. ESLint issues are
+      # surfaced in the log but don't block the PR. This is useful while the
+      # team is still cleaning up existing lint warnings.
+      # =======================================================================
+      - name: "🔍 Lint frontend (React) with ESLint"
+        working-directory: frontend/
+        run: |
+          # Run ESLint across all JS/JSX files in the frontend directory.
+          # "|| true" makes this advisory-only — warnings appear in the log
+          # but won't fail the build. Remove "|| true" to enforce strictly.
+          npx eslint . --ext js,jsx --report-unused-disable-directives --max-warnings 0 || true

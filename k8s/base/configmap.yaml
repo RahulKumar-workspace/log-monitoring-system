@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: log-monitoring-app
+  labels:
+    app.kubernetes.io/name: app-config
+    app.kubernetes.io/part-of: log-monitoring-system
+data:
+  LOG_LEVEL: "INFO"
+  APP_NAME: "log-monitoring-backend"
+  CORS_ORIGINS: "*"
+  ENABLE_METRICS: "true"
+  ENVIRONMENT: "production"
+  
+  # IMPORTANT React Environment Variable Note:
+  # Because the React app is served to the client browser and runs client-side,
+  # the browser must be able to reach VITE_API_BASE_URL.
+  # For local testing, we can use localhost:8000 or the Ingress hostname.
+  VITE_API_BASE_URL: "http://localhost:8000"

@@ -1,0 +1,33 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+  - ../../monitoring
+  - ../../ingress
+
+# Local Development Patches:
+# Scale down frontend and backend replicas to 1 to reduce resource consumption on local dev machines.
+patches:
+  - patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: backend-deployment
+        namespace: log-monitoring-app
+      spec:
+        replicas: 1
+    target:
+      kind: Deployment
+      name: backend-deployment
+  - patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: frontend-deployment
+        namespace: log-monitoring-app
+      spec:
+        replicas: 1
+    target:
+      kind: Deployment
+      name: frontend-deployment

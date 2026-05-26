@@ -1,0 +1,273 @@
+# =============================================================================
+# CI/CD — Build & Push to GHCR
+# =============================================================================
+#
+# This workflow builds multi-architecture Docker images (AMD64 + ARM64) for
+# both the backend and frontend services, then pushes them to the GitHub
+# Container Registry (GHCR).
+#
+# KEY CONCEPTS FOR BEGINNERS:
+#
+# 1. GHCR (GitHub Container Registry)
+#    GitHub provides a built-in container registry at ghcr.io. Every GitHub
+#    repository can push Docker images there without setting up Docker Hub
+#    or any external registry. Images are scoped to your repository, e.g.:
+#      ghcr.io/<owner>/<repo>/backend:latest
+#
+# 2. GITHUB_TOKEN Authentication
+#    GitHub automatically creates a special token (${{ secrets.GITHUB_TOKEN }})
+#    for every workflow run. This token can authenticate with GHCR — you do
+#    NOT need to create any personal access tokens or store any secrets
+#    manually. Just grant `packages: write` permission (see below).
+#
+# 3. Multi-Architecture Builds
+#    By building for linux/amd64 AND linux/arm64, the resulting image works
+#    on both Intel/AMD machines and ARM-based machines (like Apple Silicon
+#    Macs, AWS Graviton, Raspberry Pi). Docker automatically pulls the
+#    correct architecture for the host.
+#
+# 4. Build Caching (GitHub Actions Cache)
+#    Docker Buildx can cache intermediate build layers in GitHub Actions'
+#    built-in cache (type=gha). This dramatically speeds up subsequent
+#    builds because unchanged layers are reused instead of rebuilt.
+# =============================================================================
+
+name: "CI/CD — Build & Push to GHCR"
+
+# -----------------------------------------------------------------------------
+# TRIGGERS
+# -----------------------------------------------------------------------------
+# This workflow runs when:
+#   - Code is pushed to the `main` branch AND the push modifies files in
+#     backend/, frontend/, or this workflow file itself (paths filter).
+#   - Someone manually triggers it via the GitHub UI (workflow_dispatch).
+#
+# The `paths` filter is important: it prevents unnecessary builds when you
+# only change documentation, README, or other non-application files.
+# -----------------------------------------------------------------------------
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - ".github/workflows/ci-build-push.yml"
+
+  # Allow manual triggering from the GitHub Actions UI tab.
+  # This is useful for re-running builds without pushing new code.
+  workflow_dispatch:
+
+# -----------------------------------------------------------------------------
+# ENVIRONMENT VARIABLES (available to ALL jobs and steps)
+# -----------------------------------------------------------------------------
+# Defining these at the top level keeps image names DRY (Don't Repeat
+# Yourself). `github.repository` resolves to "<owner>/<repo>", so the
+# full image paths become e.g. ghcr.io/myuser/myrepo/backend
+# -----------------------------------------------------------------------------
+env:
+  REGISTRY: ghcr.io
+  BACKEND_IMAGE: ghcr.io/${{ github.repository }}/backend
+  FRONTEND_IMAGE: ghcr.io/${{ github.repository }}/frontend
+
+jobs:
+  # ===========================================================================
+  # JOB: build-and-push
+  # ===========================================================================
+  # This single job handles building and pushing BOTH images. If you prefer,
+  # you could split backend and frontend into separate jobs that run in
+  # parallel — but a single job is simpler and avoids duplicate setup steps.
+  # ===========================================================================
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    # -------------------------------------------------------------------------
+    # PERMISSIONS
+    # -------------------------------------------------------------------------
+    # - contents: read   → Allows checking out the repository code.
+    # - packages: write  → Allows pushing images to GHCR.
+    #
+    # These are the MINIMUM permissions needed. GitHub's default token has
+    # broader permissions, but it's a security best practice to request only
+    # what you need (principle of least privilege).
+    # -------------------------------------------------------------------------
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # -----------------------------------------------------------------------
+      # STEP 1: Checkout the repository
+      # -----------------------------------------------------------------------
+      # Clones your repository code so subsequent steps can access the
+      # Dockerfiles and source code in ./backend and ./frontend.
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # STEP 2: Set up QEMU for multi-architecture builds
+      # -----------------------------------------------------------------------
+      # QEMU is an emulator that lets you build Docker images for
+      # architectures different from the runner's native arch (x86_64).
+      # Without QEMU, you CANNOT build ARM64 images on an AMD64 runner.
+      #
+      # This step registers QEMU binary handlers with the Linux kernel so
+      # Docker Buildx can transparently execute ARM64 instructions during
+      # the build process.
+      # -----------------------------------------------------------------------
+      - name: Set up QEMU (for ARM64 cross-compilation)
+        uses: docker/setup-qemu-action@v3
+        # By default, this sets up emulation for ALL supported platforms.
+        # You could restrict it with: platforms: linux/arm64
+
+      # -----------------------------------------------------------------------
+      # STEP 3: Set up Docker Buildx
+      # -----------------------------------------------------------------------
+      # Buildx is Docker's extended build tool that supports:
+      #   - Multi-platform builds (linux/amd64 + linux/arm64 in one command)
+      #   - Advanced caching backends (GitHub Actions cache, registry cache)
+      #   - Building and pushing in a single step
+      #
+      # The default `docker build` command does NOT support multi-platform
+      # builds — you MUST use Buildx for that.
+      # -----------------------------------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # -----------------------------------------------------------------------
+      # STEP 4: Log in to GitHub Container Registry (GHCR)
+      # -----------------------------------------------------------------------
+      # Authenticates with ghcr.io so we can push images in later steps.
+      #
+      # IMPORTANT — No manual secrets needed!
+      #   - username: `github.actor` is the user/bot that triggered the run.
+      #   - password: `secrets.GITHUB_TOKEN` is automatically provided by
+      #     GitHub for every workflow run. It has the permissions defined
+      #     in the `permissions:` block above.
+      #
+      # After this step, all subsequent `docker push` commands (or
+      # build-push-action pushes) are authenticated.
+      # -----------------------------------------------------------------------
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # =======================================================================
+      #                          BACKEND IMAGE
+      # =======================================================================
+
+      # -----------------------------------------------------------------------
+      # STEP 5: Extract metadata & tags for the backend image
+      # -----------------------------------------------------------------------
+      # The metadata-action automatically generates useful Docker tags:
+      #
+      #   - type=sha
+      #     Creates a tag from the short Git commit SHA, e.g.:
+      #       ghcr.io/<owner>/<repo>/backend:sha-a1b2c3d
+      #     This gives you a unique, immutable tag for every commit — great
+      #     for rollbacks and traceability.
+      #
+      #   - type=raw,value=latest,enable={{is_default_branch}}
+      #     Tags the image as "latest" ONLY when building from the default
+      #     branch (main). This ensures `latest` always points to the most
+      #     recent main-branch build.
+      #
+      # The action also generates OCI-standard labels (org.opencontainers.*)
+      # with commit info, repo URL, etc. These labels are embedded in the
+      # image for provenance tracking.
+      # -----------------------------------------------------------------------
+      - name: Extract metadata (tags & labels) for backend
+        id: meta-backend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.BACKEND_IMAGE }}
+          tags: |
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # -----------------------------------------------------------------------
+      # STEP 6: Build and push the backend image
+      # -----------------------------------------------------------------------
+      # This is where the actual Docker build happens. Key options:
+      #
+      #   context: ./backend
+      #     The build context — Docker will look for a Dockerfile in this
+      #     directory and send all files in it to the build engine.
+      #
+      #   platforms: linux/amd64,linux/arm64
+      #     Build for BOTH architectures. Buildx creates a "manifest list"
+      #     (multi-arch image) that Docker clients automatically resolve to
+      #     the correct platform.
+      #
+      #   push: true
+      #     Push the built image directly to GHCR. With Buildx, build and
+      #     push happen in one step — no separate `docker push` needed.
+      #
+      #   tags & labels
+      #     Come from the metadata step above (step 5).
+      #
+      #   cache-from / cache-to (GitHub Actions cache)
+      #     - cache-from: type=gha  → Pull cached layers from GHA cache
+      #     - cache-to: type=gha,mode=max  → Push ALL layers to cache
+      #       (mode=max caches every layer, not just the final ones;
+      #        this maximizes cache hits for future builds)
+      #
+      #     Without caching, every build would re-download base images and
+      #     re-run every Dockerfile step. With GHA caching, unchanged layers
+      #     are reused, cutting build times from minutes to seconds.
+      # -----------------------------------------------------------------------
+      - name: Build and push backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta-backend.outputs.tags }}
+          labels: ${{ steps.meta-backend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # =======================================================================
+      #                         FRONTEND IMAGE
+      # =======================================================================
+
+      # -----------------------------------------------------------------------
+      # STEP 7: Extract metadata & tags for the frontend image
+      # -----------------------------------------------------------------------
+      # Same tagging strategy as backend:
+      #   - Commit SHA tag for immutable, traceable references
+      #   - "latest" tag only on the default branch
+      # -----------------------------------------------------------------------
+      - name: Extract metadata (tags & labels) for frontend
+        id: meta-frontend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.FRONTEND_IMAGE }}
+          tags: |
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # -----------------------------------------------------------------------
+      # STEP 8: Build and push the frontend image
+      # -----------------------------------------------------------------------
+      # Identical configuration to the backend build, but with:
+      #   - context: ./frontend  (different Dockerfile / source code)
+      #   - Tags/labels from the frontend metadata step
+      #
+      # Both images share the same GHA cache namespace, but Buildx handles
+      # cache key scoping internally so there are no collisions.
+      # -----------------------------------------------------------------------
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta-frontend.outputs.tags }}
+          labels: ${{ steps.meta-frontend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

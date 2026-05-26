@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - backend-deployment.yaml
+  - backend-service.yaml
+  - frontend-deployment.yaml
+  - frontend-service.yaml
+  - hpa.yaml
+
+# Default images — these are the LOCAL dev images.
+# The prod overlay and CI/CD pipeline override these with GHCR URLs.
+# Kustomize `images` lets us swap image names/tags without editing deployment YAMLs.
+images:
+  - name: backend
+    newName: backend
+    newTag: latest
+  - name: frontend
+    newName: frontend
+    newTag: latest

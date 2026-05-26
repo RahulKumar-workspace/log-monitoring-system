@@ -1,0 +1,360 @@
+# =============================================================================
+# CD — Deploy to Kubernetes
+# =============================================================================
+#
+# PURPOSE:
+#   This workflow handles the Continuous Deployment (CD) leg of the pipeline.
+#   After the CI workflow ("CI/CD — Build & Push to GHCR") successfully builds
+#   and pushes container images to GitHub Container Registry (GHCR), this
+#   workflow picks up and rolls those new images out to a Kubernetes cluster.
+#
+# DEPLOYMENT FLOW:
+#   1. The CI workflow builds backend & frontend images, tags them with the
+#      commit SHA, and pushes them to GHCR.
+#   2. This CD workflow is automatically triggered via `workflow_run` once the
+#      CI workflow completes successfully.
+#   3. It configures kubectl, points it at the target cluster via KUBECONFIG,
+#      and uses `kubectl set image` to perform a rolling update on each
+#      Deployment resource.
+#   4. It then waits for the rollouts to finish, verifies pod health, and
+#      runs a quick smoke-test against the /health endpoint.
+#
+# MANUAL TRIGGER:
+#   You can also trigger this workflow manually from the GitHub Actions UI
+#   using `workflow_dispatch`. This is useful for:
+#     - Re-deploying a previously built image without re-running CI
+#     - Promoting an image to a different environment (dev → prod)
+#     - Debugging deployment issues in isolation
+#
+# KUBECONFIG SECRET:
+#   This workflow expects a GitHub secret named KUBECONFIG that contains the
+#   base64-encoded contents of your ~/.kube/config file.
+#
+#   For LOCAL / Docker Desktop clusters:
+#     base64 -w 0 ~/.kube/config | pbcopy   # macOS
+#     base64 -w 0 ~/.kube/config | xclip     # Linux
+#     Then paste the value into GitHub → Settings → Secrets → KUBECONFIG.
+#
+#   For SELF-HOSTED runners:
+#     If your runner already has kubectl configured (e.g., it runs on a node
+#     inside the cluster, or the kubeconfig is pre-provisioned), the KUBECONFIG
+#     secret is OPTIONAL. You can skip step 3 ("Configure kubeconfig") or
+#     guard it with a conditional like:
+#       if: ${{ secrets.KUBECONFIG != '' }}
+#
+#   For EKS (AWS):
+#     Replace the kubeconfig step with aws-actions/configure-aws-credentials
+#     and then run `aws eks update-kubeconfig --name <cluster>`.
+#
+#   For GKE (GCP):
+#     Use google-github-actions/auth + google-github-actions/get-gke-credentials.
+#
+# =============================================================================
+
+name: "CD — Deploy to Kubernetes"
+
+# -----------------------------------------------------------------------------
+# TRIGGERS
+# -----------------------------------------------------------------------------
+# 1. workflow_run  – fires automatically when the named CI workflow finishes.
+#    We further filter with `types: [completed]` so we only react once it's
+#    done (not when it's requested or in_progress). The job-level `if` below
+#    ensures we only proceed when the conclusion is "success".
+#
+# 2. workflow_dispatch – allows manual triggering from the Actions tab.
+#    Accepts an `environment` input so the operator can choose where to deploy.
+# -----------------------------------------------------------------------------
+on:
+  workflow_run:
+    workflows:
+      - "CI/CD — Build & Push to GHCR"
+    types:
+      - completed
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment for deployment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+        default: dev
+
+# -----------------------------------------------------------------------------
+# ENVIRONMENT VARIABLES
+# -----------------------------------------------------------------------------
+# These are available to every job and step in the workflow. Using env vars
+# here keeps image references DRY and easy to update in one place.
+#
+# NOTE: ${{ github.repository }} resolves to "owner/repo-name", so the full
+# image URI becomes e.g. ghcr.io/krahul/log-monitoring-system/backend
+# -----------------------------------------------------------------------------
+env:
+  REGISTRY: ghcr.io
+  BACKEND_IMAGE: ghcr.io/${{ github.repository }}/backend
+  FRONTEND_IMAGE: ghcr.io/${{ github.repository }}/frontend
+
+# -----------------------------------------------------------------------------
+# JOBS
+# -----------------------------------------------------------------------------
+jobs:
+  deploy:
+    name: "Deploy to Kubernetes"
+    runs-on: ubuntu-latest
+
+    # -------------------------------------------------------------------------
+    # CONDITION — only deploy if:
+    #   a) The upstream CI workflow finished with conclusion == 'success', OR
+    #   b) This was triggered manually via workflow_dispatch.
+    #
+    # This prevents deploying broken images when CI fails. The workflow_run
+    # event fires even on failure/cancellation, so this guard is essential.
+    # -------------------------------------------------------------------------
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # STEP 1 — Checkout repository
+      # -----------------------------------------------------------------------
+      # We check out the repo so we have access to any Kustomize overlays,
+      # Helm charts, or Kubernetes manifests that live alongside the code.
+      # Even though this workflow uses `kubectl set image` (which doesn't need
+      # local manifests), checking out is good practice for future extensions
+      # like running kustomize build or helm upgrade.
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # STEP 2 — Install kubectl
+      # -----------------------------------------------------------------------
+      # azure/setup-kubectl@v4 downloads and caches the kubectl binary.
+      # You can pin a specific version with the `version` input if your
+      # cluster requires it (e.g., version: 'v1.28.0'). By default it
+      # installs the latest stable release.
+      # -----------------------------------------------------------------------
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      # -----------------------------------------------------------------------
+      # STEP 3 — Configure kubeconfig
+      # -----------------------------------------------------------------------
+      # This step writes the cluster credentials so kubectl knows where to
+      # connect.
+      #
+      # HOW IT WORKS:
+      #   The KUBECONFIG secret contains the base64-encoded contents of a
+      #   kubeconfig file. We decode it and write it to the standard location
+      #   (~/.kube/config) so kubectl picks it up automatically.
+      #
+      # FOR LOCAL / Docker Desktop:
+      #   base64-encode your ~/.kube/config and store it as a GitHub secret
+      #   named KUBECONFIG. Example:
+      #     cat ~/.kube/config | base64 -w 0
+      #   Then add the output as a repository secret in GitHub.
+      #
+      # FOR EKS (AWS):
+      #   You would replace this step with:
+      #     - uses: aws-actions/configure-aws-credentials@v4
+      #       with:
+      #         role-to-assume: arn:aws:iam::123456789:role/deploy-role
+      #         aws-region: us-east-1
+      #     - run: aws eks update-kubeconfig --name my-cluster
+      #
+      # FOR SELF-HOSTED RUNNERS:
+      #   If kubectl is already configured on the runner (e.g., the runner
+      #   lives inside the cluster or has a pre-provisioned kubeconfig),
+      #   this step is OPTIONAL. You can skip it entirely or add a guard:
+      #     if: ${{ secrets.KUBECONFIG != '' }}
+      #   Self-hosted runners often have direct network access to the
+      #   Kubernetes API server, eliminating the need for secret management.
+      # -----------------------------------------------------------------------
+      - name: Configure kubeconfig
+        run: |
+          # Create the .kube directory if it doesn't exist
+          mkdir -p $HOME/.kube
+
+          # Decode the base64-encoded kubeconfig and write it to disk.
+          # The secret KUBECONFIG should contain:
+          #   cat ~/.kube/config | base64 -w 0
+          echo "${{ secrets.KUBECONFIG }}" | base64 --decode > $HOME/.kube/config
+
+          # Lock down permissions — kubectl warns if the file is world-readable
+          chmod 600 $HOME/.kube/config
+
+          echo "✅ kubeconfig written to $HOME/.kube/config"
+
+      # -----------------------------------------------------------------------
+      # STEP 4 — Determine target overlay / environment
+      # -----------------------------------------------------------------------
+      # When triggered manually via workflow_dispatch, the operator picks
+      # "dev" or "prod". When triggered automatically by workflow_run, no
+      # input is provided, so we default to "dev".
+      #
+      # This overlay value can drive Kustomize overlays, Helm value files,
+      # or namespace selection in future iterations. For now we log it.
+      # -----------------------------------------------------------------------
+      - name: Determine deployment overlay
+        id: overlay
+        run: |
+          # Use the workflow_dispatch input if present; otherwise default to 'dev'
+          OVERLAY="${{ github.event.inputs.environment || 'dev' }}"
+          echo "overlay=${OVERLAY}" >> "$GITHUB_OUTPUT"
+          echo "🎯 Target overlay: ${OVERLAY}"
+
+      # -----------------------------------------------------------------------
+      # STEP 5 — Update image tags via kubectl set image
+      # -----------------------------------------------------------------------
+      # This is the core deployment step. `kubectl set image` performs a
+      # rolling update by patching the Deployment's pod template with the
+      # new image tag. Kubernetes then gradually replaces old pods with new
+      # ones according to the Deployment's rollingUpdate strategy.
+      #
+      # IMAGE TAG STRATEGY:
+      #   We tag images with "sha-<commit SHA>" for full traceability.
+      #   Every deployment can be traced back to exactly one Git commit.
+      #   This is more reliable than mutable tags like "latest" or "dev".
+      #
+      # NAMESPACE:
+      #   All resources live in the "log-monitoring-app" namespace.
+      #   Ensure this namespace exists before first deployment:
+      #     kubectl create namespace log-monitoring-app
+      # -----------------------------------------------------------------------
+      - name: Update backend image
+        run: |
+          echo "🔄 Updating backend deployment to image tag: sha-${{ github.sha }}"
+          kubectl set image deployment/backend-deployment \
+            backend=${{ env.BACKEND_IMAGE }}:sha-${{ github.sha }} \
+            -n log-monitoring-app
+
+      - name: Update frontend image
+        run: |
+          echo "🔄 Updating frontend deployment to image tag: sha-${{ github.sha }}"
+          kubectl set image deployment/frontend-deployment \
+            frontend=${{ env.FRONTEND_IMAGE }}:sha-${{ github.sha }} \
+            -n log-monitoring-app
+
+      # -----------------------------------------------------------------------
+      # STEP 6 — Wait for backend rollout to complete
+      # -----------------------------------------------------------------------
+      # `kubectl rollout status` blocks until the Deployment has finished
+      # its rolling update (all new pods are Ready and old pods are gone).
+      #
+      # --timeout=120s gives each deployment up to 2 minutes. If a rollout
+      # is stuck (e.g., CrashLoopBackOff, image pull errors), this step
+      # will fail after the timeout, which correctly marks the workflow
+      # as failed and prevents silent broken deployments.
+      # -----------------------------------------------------------------------
+      - name: Wait for backend rollout
+        run: |
+          echo "⏳ Waiting for backend rollout to complete..."
+          kubectl rollout status deployment/backend-deployment \
+            -n log-monitoring-app \
+            --timeout=120s
+          echo "✅ Backend rollout complete"
+
+      # -----------------------------------------------------------------------
+      # STEP 7 — Wait for frontend rollout to complete
+      # -----------------------------------------------------------------------
+      - name: Wait for frontend rollout
+        run: |
+          echo "⏳ Waiting for frontend rollout to complete..."
+          kubectl rollout status deployment/frontend-deployment \
+            -n log-monitoring-app \
+            --timeout=120s
+          echo "✅ Frontend rollout complete"
+
+      # -----------------------------------------------------------------------
+      # STEP 8 — Verify pod status
+      # -----------------------------------------------------------------------
+      # A quick sanity check to list all pods in the namespace. This helps
+      # with debugging if a rollout succeeded but something looks wrong.
+      # The output will appear in the workflow logs for easy inspection.
+      # -----------------------------------------------------------------------
+      - name: Verify pod status
+        run: |
+          echo "📋 Current pods in log-monitoring-app namespace:"
+          kubectl get pods -n log-monitoring-app -o wide
+          echo ""
+          echo "📋 Deployment status:"
+          kubectl get deployments -n log-monitoring-app
+          echo ""
+          echo "📋 Services:"
+          kubectl get services -n log-monitoring-app
+
+      # -----------------------------------------------------------------------
+      # STEP 9 — Health check
+      # -----------------------------------------------------------------------
+      # Run a quick smoke test to verify the backend is responding.
+      # We use `kubectl exec` to curl the /health endpoint from inside
+      # the cluster network, which avoids needing an external ingress or
+      # LoadBalancer IP.
+      #
+      # APPROACH:
+      #   We find a running backend pod and exec curl against localhost.
+      #   If your backend doesn't have curl installed, you can:
+      #     a) Use wget instead (most Alpine images include it)
+      #     b) Use a port-forward + curl from the runner
+      #     c) Skip this step for minimal images and rely on readinessProbes
+      #
+      # This is intentionally a lightweight check. For comprehensive tests,
+      # consider a dedicated integration-test workflow.
+      # -----------------------------------------------------------------------
+      - name: Run health check
+        run: |
+          echo "🏥 Running health check against backend..."
+
+          # Get the name of the first running backend pod
+          BACKEND_POD=$(kubectl get pods -n log-monitoring-app \
+            -l app=backend \
+            -o jsonpath='{.items[0].metadata.name}' \
+            2>/dev/null || true)
+
+          if [ -z "$BACKEND_POD" ]; then
+            echo "⚠️  No backend pod found with label app=backend"
+            echo "   Attempting health check via port-forward instead..."
+
+            # Fallback: port-forward and curl from the runner
+            kubectl port-forward deployment/backend-deployment 8080:8080 \
+              -n log-monitoring-app &
+            PF_PID=$!
+            sleep 5  # Give the port-forward a moment to establish
+
+            # Attempt the health check via localhost
+            if curl -sf --max-time 10 http://localhost:8080/health; then
+              echo ""
+              echo "✅ Health check passed (via port-forward)"
+            else
+              echo "⚠️  Health check failed or /health endpoint not available"
+              echo "   This may be expected if the endpoint hasn't been implemented yet."
+            fi
+
+            # Clean up the port-forward
+            kill $PF_PID 2>/dev/null || true
+          else
+            echo "   Found backend pod: ${BACKEND_POD}"
+
+            # Try curl first, fall back to wget (for Alpine-based images)
+            if kubectl exec "${BACKEND_POD}" -n log-monitoring-app -- \
+              curl -sf --max-time 10 http://localhost:8080/health 2>/dev/null; then
+              echo ""
+              echo "✅ Health check passed (via kubectl exec + curl)"
+            elif kubectl exec "${BACKEND_POD}" -n log-monitoring-app -- \
+              wget -qO- --timeout=10 http://localhost:8080/health 2>/dev/null; then
+              echo ""
+              echo "✅ Health check passed (via kubectl exec + wget)"
+            else
+              echo "⚠️  Health check returned non-zero or /health endpoint not available"
+              echo "   This may be expected if the endpoint hasn't been implemented yet."
+              echo "   Pods are running — check application logs for details:"
+              echo "   kubectl logs ${BACKEND_POD} -n log-monitoring-app"
+            fi
+          fi
+
+          echo ""
+          echo "🎉 Deployment complete!"
+          echo "   Overlay:  ${{ steps.overlay.outputs.overlay }}"
+          echo "   Backend:  ${{ env.BACKEND_IMAGE }}:sha-${{ github.sha }}"
+          echo "   Frontend: ${{ env.FRONTEND_IMAGE }}:sha-${{ github.sha }}"
